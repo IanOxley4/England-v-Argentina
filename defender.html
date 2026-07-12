@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini Defender</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #05060f;
+    color: #cfe8ff;
+    font-family: "Courier New", monospace;
+    overflow: hidden;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 10px;
+  }
+  canvas {
+    background: #05060f;
+    border: 2px solid #1b3a5c;
+    box-shadow: 0 0 30px rgba(40,120,200,0.25);
+    max-width: 100%;
+    max-height: 78vh;
+    image-rendering: pixelated;
+  }
+  #help {
+    font-size: 13px;
+    color: #6b8fb5;
+    text-align: center;
+    letter-spacing: 1px;
+  }
+  b { color: #7fd0ff; }
+
+  /* on-screen controls — shown only on touch devices */
+  #touch { display: none; }
+  body.touch #touch {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 14px 18px calc(14px + env(safe-area-inset-bottom));
+    box-sizing: border-box;
+    pointer-events: none;
+    z-index: 10;
+  }
+  body.touch #help { display: none; }
+  body.touch canvas { max-height: 56vh; }
+  #dpad {
+    display: grid;
+    grid-template-columns: repeat(3, 58px);
+    grid-template-rows: repeat(3, 58px);
+    gap: 6px;
+    pointer-events: auto;
+  }
+  .pad {
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 26px; color: #cfe8ff;
+    background: rgba(30,70,110,0.35);
+    border: 2px solid #2a5f8f;
+    border-radius: 10px;
+  }
+  .pad:active { background: rgba(80,160,220,0.55); }
+  #pad-up    { grid-column: 2; grid-row: 1; }
+  #pad-left  { grid-column: 1; grid-row: 2; }
+  #pad-right { grid-column: 3; grid-row: 2; }
+  #pad-down  { grid-column: 2; grid-row: 3; }
+  #fire {
+    -webkit-user-select: none; user-select: none;
+    touch-action: none; pointer-events: auto;
+    width: 108px; height: 108px; border-radius: 50%;
+    font: bold 22px "Courier New", monospace;
+    color: #05060f; background: #7fd0ff;
+    border: 3px solid #e6f6ff;
+  }
+  #fire:active { background: #ffe27a; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="900" height="520"></canvas>
+  <div id="help">
+    Knock out <b>2</b> Argentina players to reach the final! &nbsp;·&nbsp; <b>&larr; &rarr; &uarr; &darr;</b> move &nbsp;·&nbsp; <b>SPACE / Z</b> fire &nbsp;·&nbsp; <b>P</b> pause &nbsp;·&nbsp; <b>R</b> restart
+  </div>
+</div>
+<div id="touch">
+  <div id="dpad">
+    <div class="pad" id="pad-up">&uarr;</div>
+    <div class="pad" id="pad-left">&larr;</div>
+    <div class="pad" id="pad-right">&rarr;</div>
+    <div class="pad" id="pad-down">&darr;</div>
+  </div>
+  <button id="fire">KICK</button>
+</div>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// ---- World is wider than the screen; camera scrolls with the player ----
+const WORLD = W * 4;
+const GROUND_Y = H - 40;
+
+const keys = {};
+addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === 'r' || e.key === 'R') resetGame();
+  if (e.key === 'p' || e.key === 'P') { if (state === 'play') state = 'pause'; else if (state === 'pause') state = 'play'; }
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// ---- Touch controls (phones/tablets) ----
+if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
+  document.body.classList.add('touch');
+}
+function bindHold(id, key) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const on = e => {
+    e.preventDefault();
+    if (key === ' ' && (state === 'over' || state === 'win')) { resetGame(); return; }
+    keys[key] = true;
+  };
+  const off = e => { e.preventDefault(); keys[key] = false; };
+  el.addEventListener('touchstart', on, { passive: false });
+  el.addEventListener('touchend', off, { passive: false });
+  el.addEventListener('touchcancel', off, { passive: false });
+  el.addEventListener('mousedown', on);
+  el.addEventListener('mouseup', off);
+  el.addEventListener('mouseleave', off);
+}
+bindHold('pad-up', 'arrowup');
+bindHold('pad-down', 'arrowdown');
+bindHold('pad-left', 'arrowleft');
+bindHold('pad-right', 'arrowright');
+bindHold('fire', ' ');
+// tap the pitch to restart once the match is over
+document.getElementById('game').addEventListener('touchstart', e => {
+  if (state === 'over' || state === 'win') { e.preventDefault(); resetGame(); }
+}, { passive: false });
+
+let state, player, bullets, enemies, particles, stars, camX, score, lives, wave, spawnTimer, shootCd, msg, goals;
+const GOALS_TO_WIN = 2;
+
+function resetGame() {
+  state = 'play';
+  camX = 0;
+  score = 0;
+  lives = 5;
+  goals = 0;
+  wave = 1;
+  spawnTimer = 0;
+  shootCd = 0;
+  msg = '';
+  bullets = [];
+  enemies = [];
+  particles = [];
+  player = { x: WORLD/2, y: H/2, vx: 0, vy: 0, dir: 1, r: 20, inv: 90 };
+  stars = [];
+  for (let i = 0; i < 160; i++) {
+    stars.push({ x: Math.random()*WORLD, y: Math.random()*GROUND_Y, z: 0.3 + Math.random()*0.9, s: Math.random()*1.6+0.4 });
+  }
+  spawnWave();
+}
+
+function spawnWave() {
+  const count = 3 + wave;
+  for (let i = 0; i < count; i++) spawnEnemy();
+}
+
+function spawnEnemy() {
+  // keep new players clear of England's position so they don't appear on top of you
+  let x = Math.random() * WORLD;
+  if (player && Math.abs(wrapDelta(x, player.x)) < 260) x = mod(x + WORLD/2, WORLD);
+  const y = 60 + Math.random() * (GROUND_Y - 120);
+  enemies.push({
+    x, y,
+    vx: (Math.random() < 0.5 ? -1 : 1) * (0.8 + Math.random()*0.8 + wave*0.1),
+    vy: 0,
+    r: 22,
+    hue: 190 + Math.random()*80,
+    fireCd: 60 + Math.random()*120,
+    wob: Math.random()*Math.PI*2
+  });
+}
+
+// ---- Helpers ----
+function wrapDelta(a, b) {
+  // shortest signed distance from a to b on the wrapped world
+  let d = b - a;
+  if (d > WORLD/2) d -= WORLD;
+  if (d < -WORLD/2) d += WORLD;
+  return d;
+}
+function mod(n, m) { return ((n % m) + m) % m; }
+
+// draw a little footballer figure, centered at (0,0), facing +x when dir=1
+function drawFootballer(dir, kit, s) {
+  s = s || 1;
+  ctx.save();
+  ctx.scale(dir * s, s);
+  const skin = '#e8b892';
+  // legs (socks + shorts)
+  ctx.strokeStyle = kit.socks; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-4, 6); ctx.lineTo(-5, 16); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4, 6);  ctx.lineTo(6, 16);  ctx.stroke();
+  // shorts
+  ctx.fillStyle = kit.shorts;
+  ctx.fillRect(-6, 2, 12, 7);
+  // torso (shirt)
+  if (kit.stripes) {
+    // sky-blue & white vertical stripes
+    const cols = ['#ffffff', '#75aadb'];
+    for (let i = 0; i < 5; i++) {
+      ctx.fillStyle = cols[i % 2];
+      ctx.fillRect(-7 + i*2.8, -9, 2.8, 12);
+    }
+  } else {
+    ctx.fillStyle = kit.shirt;
+    ctx.fillRect(-7, -9, 14, 12);
+  }
+  ctx.strokeStyle = kit.outline; ctx.lineWidth = 1.2;
+  ctx.strokeRect(-7, -9, 14, 12);
+  // arms
+  ctx.strokeStyle = skin; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-7, -6); ctx.lineTo(-11, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(7, -6);  ctx.lineTo(12, -2); ctx.stroke();
+  // head
+  ctx.fillStyle = skin;
+  ctx.beginPath(); ctx.arc(0, -15, 5, 0, 7); ctx.fill();
+  ctx.strokeStyle = kit.outline; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(0, -15, 5, 0, 7); ctx.stroke();
+  ctx.restore();
+}
+
+// draw a football at (sx, sy)
+function drawBall(sx, sy, r) {
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7); ctx.stroke();
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.arc(sx, sy, Math.max(1, r*0.35), 0, 7); ctx.fill();
+}
+
+function boom(x, y, hue, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random()*Math.PI*2, sp = Math.random()*4+1;
+    particles.push({ x, y, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, life: 30+Math.random()*20, hue });
+  }
+}
+
+// ---- Update ----
+function update() {
+  if (state !== 'play') return;
+
+  // player movement
+  const accel = 0.6, max = 6.5;
+  if (keys['arrowleft'])  { player.vx -= accel; player.dir = -1; }
+  if (keys['arrowright']) { player.vx += accel; player.dir = 1; }
+  if (keys['arrowup'])    player.vy -= accel;
+  if (keys['arrowdown'])  player.vy += accel;
+  player.vx *= 0.92; player.vy *= 0.9;
+  player.vx = Math.max(-max, Math.min(max, player.vx));
+  player.vy = Math.max(-max, Math.min(max, player.vy));
+  player.x = mod(player.x + player.vx, WORLD);
+  player.y = Math.max(30, Math.min(GROUND_Y - 10, player.y + player.vy));
+  if (player.inv > 0) player.inv--;
+
+  // camera keeps player at ~40% of screen depending on facing
+  const targetCam = mod(player.x - (player.dir > 0 ? W*0.35 : W*0.65), WORLD);
+  // smooth on the wrapped axis
+  camX = mod(camX + wrapDelta(camX, targetCam) * 0.12, WORLD);
+
+  // shooting
+  if (shootCd > 0) shootCd--;
+  if ((keys[' '] || keys['z']) && shootCd === 0) {
+    bullets.push({ x: player.x + player.dir*16, y: player.y, vx: player.dir*13, life: 60, own: 'p' });
+    shootCd = 8;
+    boom(player.x + player.dir*16, player.y, 55, 2);
+  }
+
+  // bullets
+  for (const b of bullets) {
+    b.x = mod(b.x + b.vx, WORLD);
+    b.life--;
+  }
+
+  // enemies
+  for (const e of enemies) {
+    e.wob += 0.05;
+    e.x = mod(e.x + e.vx, WORLD);
+    e.y += Math.sin(e.wob) * 0.8;
+    e.y = Math.max(40, Math.min(GROUND_Y - 20, e.y));
+    // drift toward player's height slowly
+    e.y += Math.sign(player.y - e.y) * 0.1;
+    e.fireCd--;
+    if (e.fireCd <= 0 && Math.abs(wrapDelta(e.x, player.x)) < W*0.4) {
+      const dx = wrapDelta(e.x, player.x), dy = player.y - e.y;
+      const d = Math.hypot(dx, dy) || 1;
+      bullets.push({ x: e.x, y: e.y, vx: dx/d*3.2, vy: dy/d*3.2, life: 130, own: 'e' });
+      e.fireCd = 170 + Math.random()*120;
+    }
+  }
+  // enemy bullets have vy too
+  for (const b of bullets) if (b.vy) b.y += b.vy;
+
+  // collisions: player bullets vs enemies
+  for (const b of bullets) {
+    if (b.own !== 'p' || b.life <= 0) continue;
+    for (const e of enemies) {
+      if (e.dead) continue;
+      if (Math.abs(wrapDelta(b.x, e.x)) < e.r && Math.abs(b.y - e.y) < e.r) {
+        e.dead = true; b.life = 0;
+        score += 100;
+        goals++;
+        boom(e.x, e.y, e.hue, 22);
+        if (goals >= GOALS_TO_WIN) { state = 'win'; }
+      }
+    }
+  }
+
+  // only enemy footballs (bullets) can hurt England — bumping players is harmless
+  let hit = false;
+  if (player.inv <= 0) {
+    for (const b of bullets) {
+      if (b.own !== 'e' || b.life <= 0) continue;
+      if (Math.abs(wrapDelta(b.x, player.x)) < player.r && Math.abs(b.y - player.y) < player.r) {
+        b.life = 0; hit = true;
+      }
+    }
+  }
+  if (hit) loseLife();
+
+  // particles
+  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vy += 0.03; p.life--; }
+
+  // cull
+  bullets = bullets.filter(b => b.life > 0);
+  enemies = enemies.filter(e => !e.dead);
+  particles = particles.filter(p => p.life > 0);
+
+  // next wave
+  spawnTimer++;
+  if (enemies.length === 0) {
+    wave++;
+    score += 250;
+    msg = 'WAVE ' + wave;
+    spawnWave();
+  }
+}
+
+function loseLife() {
+  boom(player.x, player.y, 15, 40);
+  lives--;
+  if (lives <= 0) {
+    state = 'over';
+  } else {
+    // respawn nudge + brief invulnerability so you can't be chain-killed
+    player.x = mod(player.x + 60, WORLD);
+    player.vx = player.vy = 0;
+    player.inv = 90;
+  }
+}
+
+// ---- Draw ----
+function draw() {
+  ctx.fillStyle = '#05060f';
+  ctx.fillRect(0, 0, W, H);
+
+  // stars (parallax)
+  for (const s of stars) {
+    const sx = mod(s.x - camX * s.z, WORLD);
+    if (sx < W) {
+      ctx.fillStyle = `rgba(160,200,255,${0.25 + s.z*0.5})`;
+      ctx.fillRect(sx, s.y, s.s, s.s);
+    }
+  }
+
+  // ground line
+  ctx.strokeStyle = '#1b3a5c';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y); ctx.lineTo(W, GROUND_Y); ctx.stroke();
+  ctx.strokeStyle = 'rgba(80,160,220,0.25)';
+  ctx.lineWidth = 1;
+  for (let gx = -mod(camX, 60); gx < W; gx += 60) {
+    ctx.beginPath(); ctx.moveTo(gx, GROUND_Y); ctx.lineTo(gx, GROUND_Y+14); ctx.stroke();
+  }
+
+  const toScreen = wx => mod(wx - camX, WORLD);
+
+  // particles
+  for (const p of particles) {
+    const sx = toScreen(p.x);
+    if (sx < W) {
+      ctx.fillStyle = `hsla(${p.hue},90%,60%,${p.life/50})`;
+      ctx.fillRect(sx-1.5, p.y-1.5, 3, 3);
+    }
+  }
+
+  // bullets
+  for (const b of bullets) {
+    const sx = toScreen(b.x);
+    if (sx > W) continue;
+    if (b.own === 'p') {
+      drawBall(sx, b.y, 4);
+    } else {
+      ctx.fillStyle = '#75aadb';
+      ctx.beginPath(); ctx.arc(sx, b.y, 3.5, 0, 7); ctx.fill();
+      ctx.strokeStyle = '#0b1a3a'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(sx, b.y, 3.5, 0, 7); ctx.stroke();
+    }
+  }
+
+  // enemies — Argentina footballers
+  for (const e of enemies) {
+    const sx = toScreen(e.x);
+    if (sx > W) continue;
+    ctx.save();
+    ctx.translate(sx, e.y);
+    drawFootballer(e.vx >= 0 ? 1 : -1, {
+      stripes: true, shorts: '#0b1a3a', socks: '#ffffff', outline: '#0b1a3a'
+    }, 1.8);
+    ctx.restore();
+  }
+
+  // player — England footballer (blinks while invulnerable)
+  if (!(player.inv > 0 && Math.floor(player.inv/5) % 2 === 0)) {
+    const px = toScreen(player.x);
+    ctx.save();
+    ctx.translate(px, player.y);
+    drawFootballer(player.dir, {
+      stripes: false, shirt: '#d21b3c', shorts: '#ffffff', socks: '#d21b3c', outline: '#7a0f22'
+    }, 1.8);
+    ctx.restore();
+  }
+
+  // HUD
+  ctx.fillStyle = '#7fd0ff';
+  ctx.font = '16px Courier New';
+  ctx.textAlign = 'left';
+  ctx.fillText('GOALS ' + goals + '/' + GOALS_TO_WIN + '  ' + '⚽'.repeat(goals), 14, 24);
+  ctx.textAlign = 'right';
+  ctx.fillText('LIVES ' + '❤'.repeat(Math.max(0,lives)), W-14, 24);
+
+  // mini radar
+  drawRadar();
+
+  // banners
+  ctx.textAlign = 'center';
+  if (state === 'pause') banner('PAUSED', 'press P to resume');
+  if (state === 'over') banner('GAME OVER', 'score ' + score + ' — press R to restart');
+  if (state === 'win') banner('THROUGH TO THE FINAL!', 'England win ' + goals + '-0 — press R to play again');
+  if (msg && state === 'play') {
+    ctx.fillStyle = `rgba(127,208,255,${Math.max(0, (spawnTimer<90?1:0))})`;
+  }
+}
+
+function drawRadar() {
+  const rw = 220, rh = 34, rx = W/2 - rw/2, ry = 34;
+  ctx.strokeStyle = 'rgba(80,160,220,0.4)';
+  ctx.strokeRect(rx, ry, rw, rh);
+  const put = (wx, wy, col, sz) => {
+    const fx = rx + mod(wx, WORLD)/WORLD * rw;
+    const fy = ry + (wy/GROUND_Y) * rh;
+    ctx.fillStyle = col;
+    ctx.fillRect(fx-sz/2, fy-sz/2, sz, sz);
+  };
+  for (const e of enemies) put(e.x, e.y, '#75aadb', 3);
+  put(player.x, player.y, '#ffffff', 4);
+  // camera window
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  const cx = rx + mod(camX, WORLD)/WORLD * rw;
+  ctx.strokeRect(cx, ry, (W/WORLD)*rw, rh);
+}
+
+function banner(a, b) {
+  ctx.fillStyle = 'rgba(5,6,15,0.8)';
+  ctx.fillRect(0, H/2-60, W, 120);
+  ctx.fillStyle = state === 'win' ? '#7CFC9A' : '#7fd0ff';
+  ctx.font = 'bold 34px Courier New';
+  ctx.fillText(a, W/2, H/2);
+  ctx.font = '18px Courier New';
+  ctx.fillStyle = '#9fc3e6';
+  ctx.fillText(b, W/2, H/2 + 34);
+}
+
+// ---- Loop ----
+function loop() {
+  update();
+  draw();
+  if (state === 'play') { if (spawnTimer > 120) msg = ''; }
+  requestAnimationFrame(loop);
+}
+
+resetGame();
+loop();
+</script>
+</body>
+</html>
